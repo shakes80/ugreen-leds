@@ -1,0 +1,27 @@
+[Unit]
+Description=UGREEN DXP2800 enclosure status and activity LEDs
+After=systemd-modules-load.service zfs-import.target zfs-mount.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ugreen-leds --daemon
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+RuntimeDirectory=ugreen-leds
+RuntimeDirectoryMode=0755
+UMask=0022
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+ReadWritePaths=/run/ugreen-leds
+DevicePolicy=closed
+DeviceAllow=char-i2c rw
+DeviceAllow=/dev/zfs rw
+
+[Install]
+WantedBy=multi-user.target

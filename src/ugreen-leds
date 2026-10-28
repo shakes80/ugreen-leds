@@ -1,0 +1,287 @@
+#!/usr/bin/python3
+"""DXP2800 status/activity LEDs, using the original MCU's SMBus protocol.
+
+Protocol derived from miskcoo/ugreen_leds_controller, MIT licensed.
+Pinned upstream revision and license are retained with the installation.
+"""
+import argparse
+import fcntl
+import json
+from pathlib import Path
+import re
+import signal
+import subprocess
+import threading
+import time
+
+NAMES = ('power', 'netdev', 'disk1', 'disk2')
+WHITE = [255, 255, 255]
+AMBER = [255, 165, 0]
+RUNTIME = Path('/run/ugreen-leds')
+
+
+def led_state(mode=1, rgb=None, brightness=255, on_ms=100, off_ms=100):
+    return dict(mode=mode, rgb=list(WHITE if rgb is None else rgb),
+                brightness=brightness, on_ms=on_ms, off_ms=off_ms)
+
+
+class Controller:
+    def __init__(self):
+        from smbus import SMBus
+        product = Path('/sys/class/dmi/id/product_name').read_text().strip()
+        version = Path('/sys/class/dmi/id/product_version').read_text().strip()
+        if product != 'DXP2800' or not version.startswith('EM_DXP2800_'):
+            raise RuntimeError('This installation supports the original DXP2800 MCU only')
+        adapters = [p for p in Path('/sys/bus/i2c/devices').glob('i2c-*')
+                    if (p / 'name').exists() and
+                    (p / 'name').read_text().startswith('SMBus I801 adapter')]
+        if len(adapters) != 1:
+            raise RuntimeError('Expected exactly one SMBus I801 adapter')
+        self.bus_number = int(adapters[0].name.split('-')[1])
+        self.bus = SMBus(self.bus_number)
+        RUNTIME.mkdir(mode=0o755, exist_ok=True)
+        self.lock = (RUNTIME / 'controller.lock').open('a')
+        self.cached = {}
+        for name in NAMES:
+            self.read(name)
+
+    def read(self, name):
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        try:
+            for attempt in range(5):
+                try:
+                    raw = self.bus.read_i2c_block_data(0x3a, 0x81 + NAMES.index(name), 11)
+                    if (len(raw) == 11 and raw[0] in range(4) and
+                            sum(raw[:-2]) > 0 and
+                            sum(raw[:-2]) == (raw[-2] << 8 | raw[-1])):
+                        on = raw[7] << 8 | raw[8]
+                        return led_state(raw[0], raw[2:5], raw[1], on,
+                                         (raw[5] << 8 | raw[6]) - on)
+                except OSError:
+                    if attempt == 4:
+                        raise
+                time.sleep(0.008)
+            raise RuntimeError('Invalid LED response checksum: ' + name)
+        finally:
+            fcntl.flock(self.lock, fcntl.LOCK_UN)
+
+    def write(self, name, command, params):
+        payload = [0, 0xa0, 1, 0, 0, command] + list(params)
+        payload += [0] * (10 - len(payload))
+        checksum = sum(payload)
+        payload += [checksum >> 8, checksum & 255]
+        # MCU checksum excludes the LED index, matching the original protocol.
+        payload[0] = NAMES.index(name)
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        try:
+            for attempt in range(5):
+                try:
+                    self.bus.write_i2c_block_data(0x3a, NAMES.index(name), payload)
+                    time.sleep(0.003)
+                    if self.bus.read_byte_data(0x3a, 0x80) == 1:
+                        return
+                except OSError:
+                    if attempt == 4:
+                        raise
+                time.sleep(0.008)
+            raise RuntimeError('LED command was not acknowledged: ' + name)
+        finally:
+            fcntl.flock(self.lock, fcntl.LOCK_UN)
+
+    def apply(self, name, state):
+        previous = self.cached.get(name, {})
+        if previous.get('rgb') != state['rgb']:
+            self.write(name, 0x02, state['rgb'])
+        if previous.get('brightness') != state['brightness']:
+            self.write(name, 0x01, [state['brightness']])
+        mode = state['mode']
+        if (previous.get('mode') != mode or
+                (mode in (2, 3) and any(previous.get(k) != state[k]
+                                      for k in ('on_ms', 'off_ms')))):
+            if mode in (0, 1):
+                self.write(name, 0x03, [mode])
+            else:
+                on, total = state['on_ms'], state['on_ms'] + state['off_ms']
+                if not 0 <= on <= total <= 65535:
+                    raise ValueError('Invalid LED timing')
+                self.write(name, 0x04 if mode == 2 else 0x05,
+                           [total >> 8, total & 255, on >> 8, on & 255])
+        self.cached[name] = dict(state)
+
+    def close(self):
+        self.bus.close()
+        self.lock.close()
+
+
+def bay_number(path):
+    match = re.search(r'/ata(\d+)/', str(path))
+    if not match:
+        match = re.search(r'(?:^|-)ata-(\d+)(?:\.|$)', str(path))
+    return int(match.group(1)) if match else None
+
+
+def zfs_health(data, expected):
+    pools = data.get('pools', {})
+    healthy = bool(pools) and set(expected).issubset(pools)
+    bad_bays = set()
+
+    def walk(node):
+        nonlocal healthy
+        bad = node.get('state', 'UNKNOWN') != 'ONLINE'
+        bad |= any(int(node.get(k, 0)) > 0
+                   for k in ('read_errors', 'write_errors', 'checksum_errors'))
+        if bad:
+            healthy = False
+            number = bay_number(node.get('phys_path', ''))
+            if number is None and node.get('path'):
+                number = bay_number(Path('/sys/class/block') /
+                                    Path(node['path']).resolve().name)
+                if number is None:
+                    number = bay_number((Path('/sys/class/block') /
+                                         Path(node['path']).resolve().name).resolve())
+            if number:
+                bad_bays.add(number)
+        for child in node.get('vdevs', {}).values():
+            walk(child)
+
+    for pool in pools.values():
+        if pool.get('state') != 'ONLINE' or int(pool.get('error_count', 0)):
+            healthy = False
+        for node in pool.get('vdevs', {}).values():
+            walk(node)
+    return {'healthy': healthy, 'bad_bays': sorted(bad_bays),
+            'pools': {name: value.get('state') for name, value in pools.items()}}
+
+
+def disk_counters(ports):
+    devices = {}
+    for block in Path('/sys/class/block').iterdir():
+        if (block / 'partition').exists():
+            continue
+        port = bay_number(block.resolve())
+        if port not in ports:
+            continue
+        try:
+            stats = [int(v) for v in (block / 'stat').read_text().split()]
+            devices[port] = {'device': block.name, 'counter': stats[0] + stats[4]}
+        except (FileNotFoundError, OSError):
+            continue
+    return devices
+
+
+def policy(config, health, devices, carrier, active):
+    brightness = config['brightness']
+    states = {'power': led_state(1 if health['healthy'] else 2,
+                                 WHITE if health['healthy'] else AMBER,
+                                 brightness, 500, 500)}
+    states['netdev'] = led_state(2 if carrier and 'netdev' in active else 1,
+                                 WHITE if carrier else AMBER, brightness)
+    for name, port in config['bays'].items():
+        bad = port in health['bad_bays']
+        mode = 2 if bad or name in active else (1 if port in devices else 0)
+        states[name] = led_state(mode, AMBER if bad else WHITE, brightness,
+                                 500 if bad else 100, 500 if bad else 100)
+    return states
+
+
+def write_status(record):
+    temporary = RUNTIME / 'status.json.tmp'
+    temporary.write_text(json.dumps(record, indent=2) + '\n')
+    temporary.replace(RUNTIME / 'status.json')
+
+
+def run(config, controller, once=False):
+    stopped = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+    signal.signal(signal.SIGINT, lambda *_: stopped.set())
+    previous, activity_until = {}, {}
+    health = {'healthy': False, 'bad_bays': [], 'pools': {}, 'error': 'Not checked'}
+    next_health = next_report = next_readback = 0
+    ports = set(config['bays'].values())
+    try:
+        while not stopped.is_set():
+            now = time.monotonic()
+            if now >= next_health:
+                try:
+                    result = subprocess.run(['/usr/sbin/zpool', 'status', '-j', '-P'],
+                                            text=True, capture_output=True,
+                                            timeout=4, check=True)
+                    health = zfs_health(json.loads(result.stdout), config['pools'])
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    health = {'healthy': False, 'bad_bays': [], 'pools': {},
+                              'error': str(error)}
+                next_health = now + config['health_interval']
+            devices = disk_counters(ports)
+            network = Path('/sys/class/net') / config['interface']
+            try:
+                carrier = (network / 'carrier').read_text().strip() == '1'
+                net_counter = sum(int((network / 'statistics' / key).read_text())
+                                  for key in ('rx_packets', 'tx_packets'))
+            except OSError:
+                carrier, net_counter = False, None
+            counters = {'netdev': net_counter}
+            counters.update({name: devices.get(port, {}).get('counter')
+                             for name, port in config['bays'].items()})
+            for name, value in counters.items():
+                if value is not None and name in previous and value != previous[name]:
+                    activity_until[name] = now + 0.25
+            previous = counters
+            active = {name for name, expiry in activity_until.items() if expiry > now}
+            states = policy(config, health, devices, carrier, active)
+            for name, state in states.items():
+                controller.apply(name, state)
+            # Reconcile MCU state after a reset or an administrator's manual change.
+            if now >= next_readback:
+                for name, desired in states.items():
+                    observed = controller.read(name)
+                    fields = ['mode', 'rgb', 'brightness']
+                    if desired['mode'] in (2, 3):
+                        fields += ['on_ms', 'off_ms']
+                    if any(observed[k] != desired[k] for k in fields):
+                        controller.cached.pop(name, None)
+                        controller.apply(name, desired)
+                        if any(controller.read(name)[k] != desired[k] for k in fields):
+                            raise RuntimeError('LED readback differs: ' + name)
+                next_readback = now + 10
+            if now >= next_report or once:
+                write_status({'updated_at': time.time(), 'bus': controller.bus_number,
+                              'interface': config['interface'], 'carrier': carrier,
+                              'health': health, 'devices': devices,
+                              'desired_leds': states})
+                next_report = now + 2
+            if once:
+                return
+            stopped.wait(config['poll_interval'])
+    finally:
+        if not once:
+            for name in NAMES:
+                controller.apply(name, led_state(mode=0, brightness=config['brightness']))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', default='/etc/ugreen-leds.json')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--status', action='store_true')
+    group.add_argument('--once', action='store_true')
+    group.add_argument('--daemon', action='store_true')
+    group.add_argument('--restore', metavar='SAVED_JSON')
+    args = parser.parse_args()
+    controller = Controller()
+    try:
+        if args.status:
+            print(json.dumps({'bus': controller.bus_number,
+                              'leds': {name: controller.read(name) for name in NAMES}}, indent=2))
+        elif args.restore:
+            saved = json.loads(Path(args.restore).read_text())
+            for name in NAMES:
+                controller.apply(name, saved['leds'][name])
+        else:
+            config = json.loads(Path(args.config).read_text())
+            run(config, controller, once=args.once)
+    finally:
+        controller.close()
+
+
+if __name__ == '__main__':
+    main()

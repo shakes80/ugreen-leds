@@ -1,0 +1,14 @@
+{
+  "interface": "nic0",
+  "bays": {
+    "disk1": 1,
+    "disk2": 2
+  },
+  "pools": [
+    "rpool",
+    "datapool"
+  ],
+  "brightness": 255,
+  "poll_interval": 0.2,
+  "health_interval": 10
+}
